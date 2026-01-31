@@ -25,11 +25,22 @@ Handle g_hCookie;
 int g_iSlotSpriteRef[MAXPLAYERS+1][5]; // Guarda o Ref do Sprite nos 5 slots
 int g_iSlotVictim[MAXPLAYERS+1][5];    // Guarda quem é a vítima de cada slot
 
+int g_iBlockBarRef[2048];              // EntRef do alvo bloqueado (evita reuso de index)
+float g_fBlockBarUntil[2048];          // Tempo ate quando o bloqueio vale
+
+ConVar g_cvBarsRate, g_cvBarsBurst, g_cvBarsLinger;
+float g_fBarTokens[MAXPLAYERS+1];
+float g_fBarLastTokenUpdate[MAXPLAYERS+1];
+float g_fSlotLastDamage[MAXPLAYERS+1][5];
+
 char g_sBarPath[] = "materials/hpbar/bar.vmt";
 #define BAR_HEIGHT 90.0
 
 public void OnPluginStart() {
     RegConsoleCmd("sm_bars", Command_ToggleBars);
+    g_cvBarsRate = CreateConVar("sm_bars_rate", "12.0", "Limite de barras novas por segundo (por jogador). 0 = desativado");
+    g_cvBarsBurst = CreateConVar("sm_bars_burst", "6.0", "Burst maximo de barras novas (por jogador).");
+    g_cvBarsLinger = CreateConVar("sm_bars_linger", "1.2", "Tempo (seg) para a barra ficar na tela apos o ultimo hit antes de comecar a sumir.");
     g_hCookie = RegClientCookie("fortnite_bars_state", "Estado das barras", CookieAccess_Protected);
     HookEvent("player_hurt", Event_Damage);
     HookEvent("infected_hurt", Event_Damage);
@@ -62,6 +73,68 @@ public Action OnTransmit(int entity, int client) {
     return Plugin_Continue;
 }
 
+bool IsVictimDyingOrDead(int victim)
+{
+    if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return true;
+
+    int lifeState = 0;
+    if (HasEntProp(victim, Prop_Data, "m_lifeState"))
+        lifeState = GetEntProp(victim, Prop_Data, "m_lifeState");
+    else if (victim <= MaxClients)
+        return !IsPlayerAlive(victim);
+
+    if (lifeState != 0) return true;
+
+    if (HasEntProp(victim, Prop_Data, "m_iHealth"))
+        return (GetEntProp(victim, Prop_Data, "m_iHealth") <= 0);
+
+    return false;
+}
+
+bool IsVictimTank(int victim)
+{
+    if (victim <= 0 || victim > MaxClients || !IsClientInGame(victim)) return false;
+    if (GetClientTeam(victim) != 3) return false;
+    if (!HasEntProp(victim, Prop_Send, "m_zombieClass")) return false;
+    return (GetEntProp(victim, Prop_Send, "m_zombieClass") == 8);
+}
+
+bool IsBarBlocked(int victim)
+{
+    if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return false;
+    int ref = EntIndexToEntRef(victim);
+    return (g_iBlockBarRef[victim] != 0 && ref == g_iBlockBarRef[victim] && GetGameTime() < g_fBlockBarUntil[victim]);
+}
+
+void BlockBarForVictim(int victim, float duration)
+{
+    if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return;
+    g_iBlockBarRef[victim] = EntIndexToEntRef(victim);
+    g_fBlockBarUntil[victim] = GetGameTime() + duration;
+    g_fBlockBar[victim] = g_fBlockBarUntil[victim];
+}
+
+bool ConsumeBarToken(int attacker)
+{
+    if (attacker <= 0 || attacker > MaxClients) return false;
+
+    float rate = g_cvBarsRate.FloatValue;
+    float burst = g_cvBarsBurst.FloatValue;
+    if (rate <= 0.0 || burst <= 0.0) return true; // desativado
+
+    float now = GetGameTime();
+    float dt = now - g_fBarLastTokenUpdate[attacker];
+    if (dt < 0.0) dt = 0.0;
+
+    g_fBarTokens[attacker] += dt * rate;
+    if (g_fBarTokens[attacker] > burst) g_fBarTokens[attacker] = burst;
+    g_fBarLastTokenUpdate[attacker] = now;
+
+    if (g_fBarTokens[attacker] < 1.0) return false;
+    g_fBarTokens[attacker] -= 1.0;
+    return true;
+}
+
 public void Frame_HealthLogic(DataPack pack) {
     pack.Reset();
     int attackerUserId = pack.ReadCell();
@@ -80,11 +153,14 @@ public void Frame_HealthLogic(DataPack pack) {
         if (sprite > 0 && IsValidEntity(sprite)) AcceptEntityInput(sprite, "Kill");
         
         // Aplica o bloqueio de 10 segundos ao fechar a barra se a vítima morreu
-        if (victim > 0 && victim < 2048) g_fBlockBar[victim] = GetGameTime() + 10.0;
+        if (victim > 0 && victim < 2048 && IsValidEntity(victim) && IsVictimDyingOrDead(victim)) {
+            BlockBarForVictim(victim, 10.0);
+        }
         
         if (attacker > 0 && g_iSlotSpriteRef[attacker][slot] == spriteRef) {
             g_iSlotVictim[attacker][slot] = 0;
             g_iSlotSpriteRef[attacker][slot] = 0;
+            g_fSlotLastDamage[attacker][slot] = 0.0;
         }
         delete pack; return;
     }
@@ -96,11 +172,14 @@ public void Frame_HealthLogic(DataPack pack) {
     ticks++;
     bool victimValid = false;
     int curHP = 0;
+    bool isDying = true;
+    bool isTank = false;
 
     // 2. Checagem de vida e estado (Dying Fix)
     if (victim > 0 && IsValidEntity(victim)) {
         curHP = GetEntProp(victim, Prop_Data, "m_iHealth");
-        bool isDying = (victim <= MaxClients) ? !IsPlayerAlive(victim) : (GetEntProp(victim, Prop_Data, "m_lifeState") != 0);
+        isDying = IsVictimDyingOrDead(victim);
+        isTank = IsVictimTank(victim);
 
         if (curHP > 0 && !isDying) victimValid = true;
     }
@@ -121,9 +200,27 @@ public void Frame_HealthLogic(DataPack pack) {
         else if (pct > 0.2) SetEntityRenderColor(sprite, 255, 255, 0, alpha);
         else SetEntityRenderColor(sprite, 255, 0, 0, alpha);
         
-        if (ticks > 70) alpha -= 10;
+        float linger = g_cvBarsLinger.FloatValue;
+        if (linger < 0.0) linger = 0.0;
+
+        float lastDmg = g_fSlotLastDamage[attacker][slot];
+        if (lastDmg <= 0.0) lastDmg = GetGameTime();
+
+        float age = GetGameTime() - lastDmg;
+        if (age <= linger) alpha = 255;
+        else alpha -= 10;
     } else {
         // --- MORTE: VAI PARA O PRETO (FRAME 0) E SOME FLUIDO ---
+        if (isTank && isDying) {
+            AcceptEntityInput(sprite, "Kill");
+            if (attacker > 0 && g_iSlotSpriteRef[attacker][slot] == spriteRef) {
+                g_iSlotVictim[attacker][slot] = 0;
+                g_iSlotSpriteRef[attacker][slot] = 0;
+                g_fSlotLastDamage[attacker][slot] = 0.0;
+            }
+            delete pack; return;
+        }
+
         alpha -= 40; 
         SetEntPropFloat(sprite, Prop_Data, "m_flFrame", 0.0); // Mostra frame preto
         SetEntityRenderColor(sprite, 255, 255, 255, (alpha < 0 ? 0 : alpha)); // Remove filtro vermelho
@@ -163,15 +260,35 @@ public void Event_Damage(Event event, const char[] name, bool dontBroadcast) {
 
     if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return;
     if (victim <= MaxClients && GetClientTeam(attacker) == GetClientTeam(victim)) return;
+    if (IsVictimDyingOrDead(victim)) return;
 
     // Trava para não criar 10 timers para o MESMO zumbi (shotgun fix)
     float currentTime = GetGameTime();
+
+    // Se a barra ja existe, so renova o tempo (nao recria timer/entidade)
+    for (int i = 0; i < 5; i++) {
+        if (g_iSlotVictim[attacker][i] != victim) continue;
+
+        int ent = EntRefToEntIndex(g_iSlotSpriteRef[attacker][i]);
+        if (ent != -1 && IsValidEntity(ent)) {
+            g_fSlotLastDamage[attacker][i] = currentTime;
+            return;
+        }
+
+        g_iSlotVictim[attacker][i] = 0;
+        g_iSlotSpriteRef[attacker][i] = 0;
+        g_fSlotLastDamage[attacker][i] = 0.0;
+    }
     if (currentTime < g_fNextAllowedBar[attacker][victim]) return;
     g_fNextAllowedBar[attacker][victim] = currentTime + 0.12; 
 
     // RESERVA O SLOT AQUI (Resolve o problema de aparecer só um Common)
+    if (!ConsumeBarToken(attacker)) return;
+
     int slot = g_iNextBarSlot[attacker];
     g_iNextBarSlot[attacker] = (slot + 1) % 5;
+
+    g_fSlotLastDamage[attacker][slot] = currentTime;
 
     DataPack pack;
     CreateDataTimer(0.1, Timer_CreateBar, pack);
@@ -190,13 +307,21 @@ public Action Timer_CreateBar(Handle timer, DataPack pack) {
     if (attacker <= 0 || !IsClientInGame(attacker) || !IsValidEntity(victim)) return Plugin_Stop;
 
     // Bloqueia a criação se o bicho estiver nos 10 segundos de "morte"
-    if (GetGameTime() < g_fBlockBar[victim]) return Plugin_Stop;
+    if (IsBarBlocked(victim)) return Plugin_Stop;
+    if (IsVictimDyingOrDead(victim)) return Plugin_Stop;
 
     // Se já existe barra ativa para esse bicho, não cria outra
     for (int i = 0; i < 5; i++) {
         if (g_iSlotVictim[attacker][i] == victim) {
             int check = EntRefToEntIndex(g_iSlotSpriteRef[attacker][i]);
-            if (check != -1 && IsValidEntity(check)) return Plugin_Stop;
+            if (check != -1 && IsValidEntity(check)) {
+                g_fSlotLastDamage[attacker][i] = GetGameTime();
+                return Plugin_Stop;
+            }
+
+            g_iSlotVictim[attacker][i] = 0;
+            g_iSlotSpriteRef[attacker][i] = 0;
+            g_fSlotLastDamage[attacker][i] = 0.0;
         }
     }
 
@@ -212,6 +337,12 @@ public Action Timer_CreateBar(Handle timer, DataPack pack) {
     }
     if (maxHP <= 0) maxHP = 100;
 
+    // Em SI (principalmente Tank), m_iMaxHealth pode vir errado (ex: 100). Garante base correta.
+    if (HasEntProp(victim, Prop_Data, "m_iHealth")) {
+        int curHP = GetEntProp(victim, Prop_Data, "m_iHealth");
+        if (curHP > maxHP) maxHP = curHP;
+    }
+
     int sprite = CreateEntityByName("env_sprite_oriented");
     if (sprite == -1) return Plugin_Stop;
 
@@ -225,6 +356,7 @@ public Action Timer_CreateBar(Handle timer, DataPack pack) {
     int spriteRef = EntIndexToEntRef(sprite);
     g_iSlotSpriteRef[attacker][slot] = spriteRef;
     g_iSlotVictim[attacker][slot] = victim;
+    g_fSlotLastDamage[attacker][slot] = GetGameTime();
 
     DataPack fPack = new DataPack();
     fPack.WriteCell(attackerUserId);
