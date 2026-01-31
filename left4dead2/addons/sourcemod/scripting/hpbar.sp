@@ -34,6 +34,7 @@ float g_fBarLastTokenUpdate[MAXPLAYERS+1];
 float g_fSlotLastDamage[MAXPLAYERS+1][5];
 int g_iTankHP[MAXPLAYERS+1];
 int g_iTankRef[MAXPLAYERS+1];
+bool g_bTakeDamageHooked[MAXPLAYERS + 1];
 
 char g_sBarPath[] = "materials/hpbar/bar.vmt";
 #define BAR_HEIGHT 90.0
@@ -49,6 +50,11 @@ public void OnPluginStart() {
     HookEvent("infected_hurt", Event_Damage);
     HookEvent("player_death", Event_PlayerDeath);
     HookEvent("player_spawn", Event_PlayerSpawn);
+
+    for (int i = 1; i <= MaxClients; i++) {
+        if (!IsClientInGame(i)) continue;
+        EnsureTakeDamageHook(i);
+    }
 }
 
 
@@ -509,4 +515,51 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
     g_fBlockBar[client] = 0.0;
     g_iTankRef[client] = 0;
     g_iTankHP[client] = 0;
+}
+
+public void OnClientPutInServer(int client)
+{
+    if (client <= 0 || client > MaxClients) return;
+    g_bTakeDamageHooked[client] = false;
+    EnsureTakeDamageHook(client);
+}
+
+public void OnClientDisconnect(int client)
+{
+    if (client <= 0 || client > MaxClients) return;
+    g_bTakeDamageHooked[client] = false;
+}
+
+void EnsureTakeDamageHook(int client)
+{
+    if (client <= 0 || client > MaxClients) return;
+    if (!IsClientInGame(client)) return;
+    if (g_bTakeDamageHooked[client]) return;
+
+    SDKHook(client, SDKHook_OnTakeDamage, OnTakeDamage_BlockTankBarOnLethal);
+    g_bTakeDamageHooked[client] = true;
+}
+
+public Action OnTakeDamage_BlockTankBarOnLethal(int victim, int &attacker, int &inflictor, float &damage, int &damagetype)
+{
+    if (victim <= 0 || victim > MaxClients) return Plugin_Continue;
+    if (!IsClientInGame(victim)) return Plugin_Continue;
+    if (!IsVictimTank(victim)) return Plugin_Continue;
+
+    if (attacker <= 0 || attacker > MaxClients) return Plugin_Continue;
+    if (!IsClientInGame(attacker) || IsFakeClient(attacker)) return Plugin_Continue;
+    if (GetClientTeam(attacker) != 2) return Plugin_Continue;
+
+    int hp = GetClientHealth(victim);
+    if (hp <= 0) return Plugin_Continue;
+
+    int dmg = RoundToCeil(damage);
+    if (dmg <= 0) return Plugin_Continue;
+
+    if (dmg >= hp) {
+        BlockBarForVictim(victim, 15.0);
+        KillBarsForVictim(victim);
+    }
+
+    return Plugin_Continue;
 }
