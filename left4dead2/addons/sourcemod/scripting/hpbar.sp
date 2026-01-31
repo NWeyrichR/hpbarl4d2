@@ -12,7 +12,7 @@ public Plugin myinfo = {
     name = "L4D2 Fortnite Health Bar (Full Fix)",
     author = "AI Assistant",
     description = "Barra alta, cor preta na morte e sem bugs",
-    version = "2.3"
+    version = "2.6"
 }
 
 
@@ -28,10 +28,12 @@ int g_iSlotVictim[MAXPLAYERS+1][5];    // Guarda quem é a vítima de cada slot
 int g_iBlockBarRef[2048];              // EntRef do alvo bloqueado (evita reuso de index)
 float g_fBlockBarUntil[2048];          // Tempo ate quando o bloqueio vale
 
-ConVar g_cvBarsRate, g_cvBarsBurst, g_cvBarsLinger;
+ConVar g_cvBarsRate, g_cvBarsBurst, g_cvBarsLinger, g_cvBarsMaxScale;
 float g_fBarTokens[MAXPLAYERS+1];
 float g_fBarLastTokenUpdate[MAXPLAYERS+1];
 float g_fSlotLastDamage[MAXPLAYERS+1][5];
+int g_iTankHP[MAXPLAYERS+1];
+int g_iTankRef[MAXPLAYERS+1];
 
 char g_sBarPath[] = "materials/hpbar/bar.vmt";
 #define BAR_HEIGHT 90.0
@@ -41,9 +43,12 @@ public void OnPluginStart() {
     g_cvBarsRate = CreateConVar("sm_bars_rate", "12.0", "Limite de barras novas por segundo (por jogador). 0 = desativado");
     g_cvBarsBurst = CreateConVar("sm_bars_burst", "6.0", "Burst maximo de barras novas (por jogador).");
     g_cvBarsLinger = CreateConVar("sm_bars_linger", "1.2", "Tempo (seg) para a barra ficar na tela apos o ultimo hit antes de comecar a sumir.");
+    g_cvBarsMaxScale = CreateConVar("sm_bars_max_scale", "0.22", "Escala maxima da barra (cap) para distancias longas. 0 = sem limite");
     g_hCookie = RegClientCookie("fortnite_bars_state", "Estado das barras", CookieAccess_Protected);
     HookEvent("player_hurt", Event_Damage);
     HookEvent("infected_hurt", Event_Damage);
+    HookEvent("player_death", Event_PlayerDeath);
+    HookEvent("player_spawn", Event_PlayerSpawn);
 }
 
 
@@ -78,17 +83,24 @@ bool IsVictimDyingOrDead(int victim)
     if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return true;
 
     int lifeState = 0;
-    if (HasEntProp(victim, Prop_Data, "m_lifeState"))
+    if (HasEntProp(victim, Prop_Send, "m_lifeState"))
+        lifeState = GetEntProp(victim, Prop_Send, "m_lifeState");
+    else if (HasEntProp(victim, Prop_Data, "m_lifeState"))
         lifeState = GetEntProp(victim, Prop_Data, "m_lifeState");
     else if (victim <= MaxClients)
         return !IsPlayerAlive(victim);
 
     if (lifeState != 0) return true;
 
-    if (HasEntProp(victim, Prop_Data, "m_iHealth"))
-        return (GetEntProp(victim, Prop_Data, "m_iHealth") <= 0);
+    int health = 0;
+    if (HasEntProp(victim, Prop_Send, "m_iHealth"))
+        health = GetEntProp(victim, Prop_Send, "m_iHealth");
+    else if (HasEntProp(victim, Prop_Data, "m_iHealth"))
+        health = GetEntProp(victim, Prop_Data, "m_iHealth");
+    else
+        return false;
 
-    return false;
+    return (health <= 0);
 }
 
 bool IsVictimTank(int victim)
@@ -97,6 +109,29 @@ bool IsVictimTank(int victim)
     if (GetClientTeam(victim) != 3) return false;
     if (!HasEntProp(victim, Prop_Send, "m_zombieClass")) return false;
     return (GetEntProp(victim, Prop_Send, "m_zombieClass") == 8);
+}
+
+bool ShouldBlockTankDeathFromHurt(Event event, int victim)
+{
+    if (!IsVictimTank(victim)) return false;
+
+    int damage = event.GetInt("dmg_health");
+    if (damage <= 0) damage = event.GetInt("amount");
+    if (damage <= 0) return false;
+
+    int eventHP = event.GetInt("health");
+    if (eventHP < 0) eventHP = 0;
+
+    int ref = EntIndexToEntRef(victim);
+    if (g_iTankRef[victim] != ref) {
+        g_iTankRef[victim] = ref;
+        g_iTankHP[victim] = eventHP + damage;
+    }
+
+    g_iTankHP[victim] -= damage;
+    if (eventHP > 0 && eventHP < g_iTankHP[victim]) g_iTankHP[victim] = eventHP;
+
+    return (g_iTankHP[victim] <= 0);
 }
 
 bool IsBarBlocked(int victim)
@@ -133,6 +168,26 @@ bool ConsumeBarToken(int attacker)
     if (g_fBarTokens[attacker] < 1.0) return false;
     g_fBarTokens[attacker] -= 1.0;
     return true;
+}
+
+void KillBarsForVictim(int victim)
+{
+    if (victim <= 0 || victim > MaxClients) return;
+
+    for (int attacker = 1; attacker <= MaxClients; attacker++) {
+        if (!IsClientInGame(attacker)) continue;
+
+        for (int slot = 0; slot < 5; slot++) {
+            if (g_iSlotVictim[attacker][slot] != victim) continue;
+
+            int ent = EntRefToEntIndex(g_iSlotSpriteRef[attacker][slot]);
+            if (ent > MaxClients && IsValidEntity(ent)) AcceptEntityInput(ent, "Kill");
+
+            g_iSlotVictim[attacker][slot] = 0;
+            g_iSlotSpriteRef[attacker][slot] = 0;
+            g_fSlotLastDamage[attacker][slot] = 0.0;
+        }
+    }
 }
 
 public void Frame_HealthLogic(DataPack pack) {
@@ -180,6 +235,7 @@ public void Frame_HealthLogic(DataPack pack) {
         curHP = GetEntProp(victim, Prop_Data, "m_iHealth");
         isDying = IsVictimDyingOrDead(victim);
         isTank = IsVictimTank(victim);
+        if (!isDying && victim <= MaxClients && IsBarBlocked(victim)) isDying = true;
 
         if (curHP > 0 && !isDying) victimValid = true;
     }
@@ -234,15 +290,45 @@ public void Frame_HealthLogic(DataPack pack) {
     }
 
     // 3. Posicionamento e Escala
-    float vEyePos[3], lookAng[3], lookVec[3];
+    float vEyePos[3], vEyeAng[3], lookVec[3];
     GetClientEyePosition(attacker, vEyePos);
+    GetClientEyeAngles(attacker, vEyeAng);
     MakeVectorFromPoints(vPos, vEyePos, lookVec);
-    GetVectorAngles(lookVec, lookAng);
-    lookAng[0] *= -1.0; lookAng[1] += 180.0;
+
+    // Angulo mais estavel (evita flip quando o player esta muito acima/abaixo)
+    float fullAng[3];
+    GetVectorAngles(lookVec, fullAng);
+    fullAng[0] *= -1.0;
+
+    float yawVec[3];
+    yawVec[0] = lookVec[0];
+    yawVec[1] = lookVec[1];
+    yawVec[2] = 0.0;
+
+    float yawAng[3];
+    float horiz = SquareRoot(yawVec[0] * yawVec[0] + yawVec[1] * yawVec[1]);
+    float yaw = 0.0;
+    if (horiz < 0.001) yaw = vEyeAng[1] + 180.0;
+    else {
+        GetVectorAngles(yawVec, yawAng);
+        yaw = yawAng[1] + 180.0;
+    }
+
+    float pitch = fullAng[0];
+    if (pitch > 80.0) pitch = 80.0;
+    else if (pitch < -80.0) pitch = -80.0;
+
+    float lookAng[3];
+    lookAng[0] = pitch;
+    lookAng[1] = yaw;
+    lookAng[2] = 0.0;
+
     TeleportEntity(sprite, vPos, lookAng, NULL_VECTOR);
 
     float scale = (GetVectorDistance(vEyePos, vPos) / 500.0) * 0.22;
     if (scale < 0.08) scale = 0.08;
+    float maxScale = g_cvBarsMaxScale.FloatValue;
+    if (maxScale > 0.0 && scale > maxScale) scale = maxScale;
     SetVariantFloat(scale); AcceptEntityInput(sprite, "SetScale");
 
     pack.Reset();
@@ -257,9 +343,40 @@ public void Event_Damage(Event event, const char[] name, bool dontBroadcast) {
 
     if (attacker <= 0 || attacker > MaxClients || !IsClientInGame(attacker) || attacker == victim || !g_bState[attacker])
         return;
+    if (GetClientTeam(attacker) != 2) return; // So sobrevivores veem barra
 
     if (victim <= 0 || victim >= 2048 || !IsValidEntity(victim)) return;
+    if (victim <= MaxClients && GetClientTeam(victim) != 3) return; // Nunca mostra em sobrevivores/amigos
     if (victim <= MaxClients && GetClientTeam(attacker) == GetClientTeam(victim)) return;
+
+    // Barra: nao mostra para dano de fogo (mas ainda corta/mata ao chegar em 0)
+    int dmgType = event.GetInt("type");
+    bool isFireDamage = (dmgType != 0 && ((dmgType & (DMG_BURN | DMG_SLOWBURN)) != 0));
+    if (!isFireDamage) {
+        char weapon[32];
+        event.GetString("weapon", weapon, sizeof(weapon));
+        if (weapon[0] != '\0') {
+            if (StrContains(weapon, "inferno", false) != -1 ||
+                StrContains(weapon, "molotov", false) != -1 ||
+                StrContains(weapon, "fire", false) != -1 ||
+                StrContains(weapon, "burn", false) != -1) {
+                isFireDamage = true;
+            }
+        }
+    }
+
+    // Detecta o frame que a vida do Tank/SI chega a 0 (player_death pode vir so depois da animacao)
+    if (StrEqual(name, "player_hurt") && victim > 0 && victim <= MaxClients) {
+        int remainingHP = event.GetInt("health");
+        if (remainingHP <= 0 || ShouldBlockTankDeathFromHurt(event, victim)) {
+            BlockBarForVictim(victim, 15.0);
+            KillBarsForVictim(victim);
+            return;
+        }
+    }
+
+    if (isFireDamage) return;
+
     if (IsVictimDyingOrDead(victim)) return;
 
     // Trava para não criar 10 timers para o MESMO zumbi (shotgun fix)
@@ -368,4 +485,28 @@ public Action Timer_CreateBar(Handle timer, DataPack pack) {
     RequestFrame(Frame_HealthLogic, fPack);
 
     return Plugin_Stop;
+}
+
+public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
+{
+    int victim = GetClientOfUserId(event.GetInt("userid"));
+    if (victim <= 0 || victim > MaxClients || !IsValidEntity(victim)) return;
+
+    // Bloqueia barras para esse mesmo player durante a animacao de morte
+    BlockBarForVictim(victim, 15.0);
+
+    // Mata barras existentes imediatamente (principalmente Tank)
+    KillBarsForVictim(victim);
+}
+
+public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast)
+{
+    int client = GetClientOfUserId(event.GetInt("userid"));
+    if (client <= 0 || client > MaxClients) return;
+
+    g_iBlockBarRef[client] = 0;
+    g_fBlockBarUntil[client] = 0.0;
+    g_fBlockBar[client] = 0.0;
+    g_iTankRef[client] = 0;
+    g_iTankHP[client] = 0;
 }
